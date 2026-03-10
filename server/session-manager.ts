@@ -125,9 +125,39 @@ export class SessionManager {
   private cleanupChromiumLocks(authPath?: string): void {
     const basePath = authPath || ".wwebjs_auth";
     try {
-      const cmd = `find "${basePath}" \\( -name "SingletonLock" -o -name "SingletonSocket" -o -name "SingletonCookie" -o -name "lockfile" -o -name "*.lock" \\) -exec rm -f {} + 2>/dev/null; find "${basePath}" -type l -name "Singleton*" -exec rm -f {} + 2>/dev/null`;
-      execSync(cmd);
+      execSync(`find "${basePath}" \\( -name "SingletonLock" -o -name "SingletonSocket" -o -name "SingletonCookie" -o -name "lockfile" -o -name "*.lock" \\) -exec rm -f {} + 2>/dev/null; find "${basePath}" -type l -name "Singleton*" -exec rm -f {} + 2>/dev/null`);
       log(`Cleaned locks in ${basePath}`, "session");
+    } catch {}
+  }
+
+  private killBrowserForDataDir(dataDir: string): void {
+    try {
+      const absPath = path.resolve(dataDir);
+      const output = execSync(
+        `ps -eo pid,args 2>/dev/null | grep -i '[c]hromium\\|[c]hrome' | grep -- "${absPath}" | awk '{print $1}'`,
+        { encoding: "utf-8" }
+      ).trim();
+      if (output) {
+        for (const pid of output.split("\n")) {
+          const p = pid.trim();
+          if (p) {
+            try {
+              execSync(`kill -9 ${p} 2>/dev/null`);
+              log(`Killed stale Chromium PID ${p} for ${dataDir}`, "session");
+            } catch {}
+          }
+        }
+        execSync("sleep 1");
+      }
+    } catch {}
+  }
+
+  private nukeSessionDir(authPath: string): void {
+    try {
+      if (fs.existsSync(authPath)) {
+        fs.rmSync(authPath, { recursive: true, force: true });
+        log(`Removed stale dir ${authPath}`, "session");
+      }
     } catch {}
   }
 
@@ -238,6 +268,10 @@ export class SessionManager {
 
     log(`Adding session ${id} for user ${userId} (isFirst=${isFirst}, authPath=${authPath})`, "session");
 
+    this.killBrowserForDataDir(authPath);
+    if (!isFirst) {
+      this.nukeSessionDir(authPath);
+    }
     try { fs.mkdirSync(authPath, { recursive: true }); } catch {}
     this.cleanupChromiumLocks(authPath);
 
@@ -282,8 +316,11 @@ export class SessionManager {
           }
           await currentClient.destroy();
         } catch {}
+        this.killBrowserForDataDir(authPath);
         if (attempt < MAX_RETRIES) {
           log(`Retrying session ${id} after cleanup...`, "session");
+          if (!isFirst) { this.nukeSessionDir(authPath); }
+          try { fs.mkdirSync(authPath, { recursive: true }); } catch {}
           this.cleanupChromiumLocks(authPath);
           await new Promise(r => setTimeout(r, 5000));
           currentClient = this.createClient(authStrategy);
