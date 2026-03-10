@@ -36,13 +36,32 @@ interface Session {
   totalInvites: number;
 }
 
+interface CachedData<T> {
+  data: T;
+  timestamp: number;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} expirou após ${ms / 1000}s`)), ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
 const MAX_ADDS_PER_HOUR = 80;
 const CHROMIUM_PATH = process.env.CHROMIUM_PATH || "/nix/store/zi4f80l169xlmivz8vja8wlphq74qqk0-chromium-125.0.6422.141/bin/chromium";
+
+const CACHE_TTL = 60000;
 
 export class SessionManager {
   private sessions = new Map<string, Session>();
   private callbacks: SessionCallbacks | null = null;
   private sessionCounter = 0;
+  private groupsCache = new Map<number, CachedData<WhatsAppGroup[]>>();
+  private contactsCache = new Map<number, CachedData<{ id: string; name: string; number: string; isLid?: boolean }[]>>();
 
   constructor() {
     this.killOrphanChromiumProcesses();
@@ -118,8 +137,8 @@ export class SessionManager {
       puppeteer: {
         headless: true,
         executablePath: CHROMIUM_PATH,
-        protocolTimeout: 300000,
-        timeout: 120000,
+        protocolTimeout: 600000,
+        timeout: 180000,
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
@@ -430,14 +449,21 @@ export class SessionManager {
   }
 
   async getGroups(userId?: number): Promise<WhatsAppGroup[]> {
+    const uid = userId ?? -1;
+    const cached = this.groupsCache.get(uid);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      log(`Groups served from cache for user ${uid}`, "session");
+      return cached.data;
+    }
+
     const session = userId !== undefined ? this.getFirstConnectedSessionForUser(userId) : this.getFirstConnectedSession();
     if (!session) throw new Error("Nenhuma sessão conectada");
 
-    const chats = await session.client.getChats();
+    const chats = await withTimeout(session.client.getChats(), 120000, "Carregar grupos");
     const groups = chats.filter((c: any) => c.isGroup);
     const me = session.client.info?.wid?._serialized;
 
-    return groups.map((g: any) => {
+    const result = groups.map((g: any) => {
       let participantCount = 0;
       const cachedParticipants = g.participants || [];
       if (cachedParticipants.length > 0) {
@@ -454,13 +480,33 @@ export class SessionManager {
         isAdmin: myP?.isAdmin || myP?.isSuperAdmin || false,
       };
     });
+
+    this.groupsCache.set(uid, { data: result, timestamp: Date.now() });
+    return result;
+  }
+
+  clearCache(userId?: number): void {
+    if (userId !== undefined) {
+      this.groupsCache.delete(userId);
+      this.contactsCache.delete(userId);
+    } else {
+      this.groupsCache.clear();
+      this.contactsCache.clear();
+    }
   }
 
   async getContacts(userId?: number): Promise<{ id: string; name: string; number: string; isLid?: boolean }[]> {
+    const uid = userId ?? -1;
+    const cached = this.contactsCache.get(uid);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+      log(`Contacts served from cache for user ${uid}`, "session");
+      return cached.data;
+    }
+
     const session = userId !== undefined ? this.getFirstConnectedSessionForUser(userId) : this.getFirstConnectedSession();
     if (!session) throw new Error("Nenhuma sessão conectada");
 
-    const chats = await session.client.getChats();
+    const chats = await withTimeout(session.client.getChats(), 120000, "Carregar contatos");
     const privateChats = chats.filter((c: any) => {
       const id = c.id?._serialized || "";
       return !c.isGroup && (id.endsWith("@c.us") || id.endsWith("@lid"));
@@ -487,7 +533,7 @@ export class SessionManager {
     }
 
     try {
-      const allContacts = await session.client.getContacts();
+      const allContacts = await withTimeout(session.client.getContacts(), 60000, "Carregar lista de contatos");
       for (const contact of allContacts) {
         const cId = (contact as any).id?._serialized || "";
         if (seenIds.has(cId)) continue;
@@ -511,6 +557,7 @@ export class SessionManager {
       log(`Error fetching additional contacts: ${(err as Error).message}`, "session");
     }
 
+    this.contactsCache.set(uid, { data: contacts, timestamp: Date.now() });
     return contacts;
   }
 
@@ -518,7 +565,7 @@ export class SessionManager {
     const session = userId !== undefined ? this.getFirstConnectedSessionForUser(userId) : this.getFirstConnectedSession();
     if (!session) throw new Error("Nenhuma sessão conectada");
 
-    const chat = await session.client.getChatById(groupId);
+    const chat = await withTimeout(session.client.getChatById(groupId), 60000, "Carregar grupo");
     if (!(chat as any).isGroup) throw new Error("Chat não é um grupo");
 
     let participants = (chat as any).participants || [];
