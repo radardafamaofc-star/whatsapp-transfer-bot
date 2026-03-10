@@ -1,5 +1,5 @@
 import pkg from "whatsapp-web.js";
-const { Client, LocalAuth } = pkg;
+const { Client } = pkg;
 import type {
   WhatsAppStatus,
   WhatsAppGroup,
@@ -11,30 +11,6 @@ import QRCode from "qrcode";
 import { execSync } from "child_process";
 import fs from "fs";
 import path from "path";
-
-class DirectAuth {
-  private dataDir: string;
-  private client: any;
-
-  constructor(dataDir: string) {
-    this.dataDir = path.resolve(dataDir);
-  }
-
-  setup(client: any) {
-    this.client = client;
-  }
-
-  async beforeBrowserInitialized() {
-    fs.mkdirSync(this.dataDir, { recursive: true });
-    this.client.options.puppeteer.userDataDir = this.dataDir;
-  }
-
-  async afterBrowserInitialized() {}
-  async afterAuthReady() {}
-  async disconnect() {}
-  async destroy() {}
-  async logout() {}
-}
 
 function randomDelay(minMs: number, maxMs: number): number {
   return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
@@ -58,6 +34,7 @@ interface Session {
   isBusy: boolean;
   totalAdds: number;
   totalInvites: number;
+  dataDir: string;
 }
 
 interface CachedData<T> {
@@ -77,8 +54,67 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 
 const MAX_ADDS_PER_HOUR = 80;
 const CHROMIUM_PATH = process.env.CHROMIUM_PATH || "/nix/store/zi4f80l169xlmivz8vja8wlphq74qqk0-chromium-125.0.6422.141/bin/chromium";
-
 const CACHE_TTL = 60000;
+const INIT_DELAY_MS = 3000;
+
+const PUPPETEER_ARGS = [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  "--no-first-run",
+  "--no-zygote",
+  "--single-process",
+  "--disable-extensions",
+  "--disable-accelerated-2d-canvas",
+  "--disable-software-rasterizer",
+  "--disable-background-networking",
+  "--disable-default-apps",
+  "--disable-translate",
+  "--disable-sync",
+  "--metrics-recording-only",
+  "--no-default-browser-check",
+  "--js-flags=--max-old-space-size=256",
+];
+
+class SessionProcessRegistry {
+  private activeDirs = new Set<string>();
+  private activePids = new Map<string, number>();
+
+  reserve(sessionId: string, dataDir: string): boolean {
+    const absDir = path.resolve(dataDir);
+    if (this.activeDirs.has(absDir)) {
+      log(`Registry: dir ${absDir} already in use, denying`, "session");
+      return false;
+    }
+    this.activeDirs.add(absDir);
+    log(`Registry: reserved ${absDir} for ${sessionId}`, "session");
+    return true;
+  }
+
+  registerPid(sessionId: string, pid: number) {
+    this.activePids.set(sessionId, pid);
+  }
+
+  release(sessionId: string, dataDir: string) {
+    this.activeDirs.delete(path.resolve(dataDir));
+    this.activePids.delete(sessionId);
+    log(`Registry: released ${sessionId}`, "session");
+  }
+
+  getActivePids(): number[] {
+    return Array.from(this.activePids.values());
+  }
+
+  isReserved(dataDir: string): boolean {
+    return this.activeDirs.has(path.resolve(dataDir));
+  }
+
+  clear() {
+    this.activeDirs.clear();
+    this.activePids.clear();
+  }
+}
 
 export class SessionManager {
   private sessions = new Map<string, Session>();
@@ -86,11 +122,31 @@ export class SessionManager {
   private sessionCounter = 0;
   private groupsCache = new Map<number, CachedData<WhatsAppGroup[]>>();
   private contactsCache = new Map<number, CachedData<{ id: string; name: string; number: string; isLid?: boolean }[]>>();
+  private registry = new SessionProcessRegistry();
+  private initQueue: Array<() => Promise<void>> = [];
+  private initRunning = false;
 
   constructor() {
-    this.killOrphanChromiumProcesses();
-    this.cleanupChromiumLocks();
-    log("SessionManager initialized, stale Chromium locks cleaned", "session");
+    this.killAllChromium();
+    this.cleanupAllLocks();
+    this.setupGracefulShutdown();
+    log("SessionManager initialized", "session");
+  }
+
+  private setupGracefulShutdown() {
+    const shutdown = async (signal: string) => {
+      log(`Received ${signal}, destroying all sessions...`, "session");
+      const promises: Promise<void>[] = [];
+      for (const session of this.sessions.values()) {
+        promises.push(this.destroyClient(session));
+      }
+      await Promise.allSettled(promises);
+      this.killAllChromium();
+      log("All sessions destroyed, exiting", "session");
+      process.exit(0);
+    };
+    process.on("SIGINT", () => shutdown("SIGINT"));
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
   }
 
   setCallbacks(cb: SessionCallbacks) {
@@ -117,46 +173,45 @@ export class SessionManager {
     return this.getSessionsForUser(userId).find((s) => s.status === "connected") || null;
   }
 
-  private killOrphanChromiumProcesses(): void {
+  private killAllChromium(): void {
     try {
-      const activePids = new Set<string>();
-      for (const session of this.sessions.values()) {
-        try {
-          const bp = session.client?.pupBrowser?.process();
-          if (bp?.pid) activePids.add(String(bp.pid));
-        } catch {}
-      }
-      try {
-        const output = execSync(
-          "ps -eo pid,args 2>/dev/null | grep -i '[c]hromium\\|[c]hrome' | grep -v playwright | awk '{print $1}'",
-          { encoding: "utf-8" }
-        ).trim();
-        if (output) {
-          for (const pid of output.split("\n")) {
-            const p = pid.trim();
-            if (p && !activePids.has(p)) {
-              try {
-                execSync(`kill -9 ${p} 2>/dev/null`);
-                log(`Killed orphan Chromium PID ${p}`, "session");
-              } catch {}
-            }
+      const activePids = new Set(this.registry.getActivePids().map(String));
+      const output = execSync(
+        "ps -eo pid,args 2>/dev/null | grep -i '[c]hromium\\|[c]hrome' | grep -v playwright | awk '{print $1}'",
+        { encoding: "utf-8" }
+      ).trim();
+      if (output) {
+        let killed = 0;
+        for (const pid of output.split("\n")) {
+          const p = pid.trim();
+          if (p && !activePids.has(p)) {
+            try { execSync(`kill -9 ${p} 2>/dev/null`); killed++; } catch {}
           }
         }
-      } catch {}
+        if (killed > 0) log(`Killed ${killed} orphan Chromium processes`, "session");
+      }
     } catch {}
   }
 
-  private cleanupChromiumLocks(authPath?: string): void {
-    const basePath = authPath || ".wwebjs_auth";
+  private cleanupAllLocks(): void {
+    const basePath = ".wwebjs_auth";
     try {
+      if (!fs.existsSync(basePath)) return;
       execSync(`find "${basePath}" \\( -name "SingletonLock" -o -name "SingletonSocket" -o -name "SingletonCookie" -o -name "lockfile" -o -name "*.lock" \\) -exec rm -f {} + 2>/dev/null; find "${basePath}" -type l -name "Singleton*" -exec rm -f {} + 2>/dev/null`);
-      log(`Cleaned locks in ${basePath}`, "session");
+      log("Cleaned all locks in .wwebjs_auth", "session");
     } catch {}
   }
 
-  private killBrowserForDataDir(dataDir: string): void {
+  private cleanupLocksInDir(dirPath: string): void {
     try {
-      const absPath = path.resolve(dataDir);
+      if (!fs.existsSync(dirPath)) return;
+      execSync(`find "${dirPath}" \\( -name "SingletonLock" -o -name "SingletonSocket" -o -name "SingletonCookie" -o -name "lockfile" -o -name "*.lock" \\) -exec rm -f {} + 2>/dev/null; find "${dirPath}" -type l -name "Singleton*" -exec rm -f {} + 2>/dev/null`);
+    } catch {}
+  }
+
+  private killProcessesForDir(dirPath: string): void {
+    try {
+      const absPath = path.resolve(dirPath);
       const output = execSync(
         `ps -eo pid,args 2>/dev/null | grep -i '[c]hromium\\|[c]hrome' | grep -- "${absPath}" | awk '{print $1}'`,
         { encoding: "utf-8" }
@@ -165,51 +220,56 @@ export class SessionManager {
         for (const pid of output.split("\n")) {
           const p = pid.trim();
           if (p) {
-            try {
-              execSync(`kill -9 ${p} 2>/dev/null`);
-              log(`Killed stale Chromium PID ${p} for ${dataDir}`, "session");
-            } catch {}
+            try { execSync(`kill -9 ${p} 2>/dev/null`); log(`Killed Chromium PID ${p} for ${dirPath}`, "session"); } catch {}
           }
         }
-        execSync("sleep 1");
       }
     } catch {}
   }
 
-  private nukeSessionDir(authPath: string): void {
+  private nukeDir(dirPath: string): void {
     try {
-      if (fs.existsSync(authPath)) {
-        fs.rmSync(authPath, { recursive: true, force: true });
-        log(`Removed stale dir ${authPath}`, "session");
+      if (fs.existsSync(dirPath)) {
+        fs.rmSync(dirPath, { recursive: true, force: true });
+        log(`Nuked dir ${dirPath}`, "session");
       }
     } catch {}
   }
 
-  private createClient(authStrategy: any): any {
+  private async destroyClient(session: Session): Promise<void> {
+    try {
+      const bp = session.client?.pupBrowser?.process();
+      const pid = bp?.pid;
+      try { await session.client.destroy(); } catch {}
+      if (pid) {
+        try { execSync(`kill -9 ${pid} 2>/dev/null`); } catch {}
+      }
+    } catch {}
+    this.killProcessesForDir(session.dataDir);
+    this.registry.release(session.id, session.dataDir);
+  }
+
+  private createClient(dataDir: string): any {
+    const absDir = path.resolve(dataDir);
+    fs.mkdirSync(absDir, { recursive: true });
     return new Client({
-      authStrategy,
+      authStrategy: {
+        setup: function(client: any) { (this as any)._client = client; },
+        beforeBrowserInitialized: function() {
+          (this as any)._client.options.puppeteer.userDataDir = absDir;
+        },
+        afterBrowserInitialized: async function() {},
+        afterAuthReady: async function() {},
+        disconnect: async function() {},
+        destroy: async function() {},
+        logout: async function() {},
+      },
       puppeteer: {
         headless: true,
         executablePath: CHROMIUM_PATH,
         protocolTimeout: 600000,
         timeout: 180000,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-accelerated-2d-canvas",
-          "--no-first-run",
-          "--disable-gpu",
-          "--disable-extensions",
-          "--disable-software-rasterizer",
-          "--disable-background-networking",
-          "--disable-default-apps",
-          "--disable-translate",
-          "--disable-sync",
-          "--metrics-recording-only",
-          "--no-default-browser-check",
-          "--js-flags=--max-old-space-size=256",
-        ],
+        args: [...PUPPETEER_ARGS, `--user-data-dir=${absDir}`],
       },
     });
   }
@@ -265,6 +325,8 @@ export class SessionManager {
       session.status = "connected";
       session.qrDataUrl = null;
       session.phoneNumber = client.info?.wid?.user || undefined;
+      const bp = client.pupBrowser?.process();
+      if (bp?.pid) this.registry.registerPid(id, bp.pid);
       this.callbacks?.onStatusChange(id, "connected");
     });
 
@@ -276,26 +338,42 @@ export class SessionManager {
     });
   }
 
+  private async processInitQueue(): Promise<void> {
+    if (this.initRunning) return;
+    this.initRunning = true;
+    while (this.initQueue.length > 0) {
+      const task = this.initQueue.shift()!;
+      try {
+        await task();
+      } catch (err: any) {
+        log(`Init queue task error: ${err.message}`, "session");
+      }
+      if (this.initQueue.length > 0) {
+        await new Promise(r => setTimeout(r, INIT_DELAY_MS));
+      }
+    }
+    this.initRunning = false;
+  }
+
   async addSession(userId: number): Promise<string> {
     this.sessionCounter++;
     const id = `session-${this.sessionCounter}`;
+    const ts = Date.now();
+    const dataDir = `.wwebjs_auth/user-${userId}/${id}-${ts}`;
 
-    const userSessions = this.getSessionsForUser(userId);
-    const isFirst = userSessions.length === 0;
-    const authPath = `.wwebjs_auth/user-${userId}-${id}`;
+    log(`Adding session ${id} for user ${userId} (dataDir=${dataDir})`, "session");
 
-    log(`Adding session ${id} for user ${userId} (isFirst=${isFirst}, authPath=${authPath})`, "session");
+    this.killProcessesForDir(dataDir);
+    this.nukeDir(dataDir);
 
-    this.killBrowserForDataDir(authPath);
-    this.cleanupChromiumLocks(authPath);
-
-    const authStrategy = new DirectAuth(authPath);
-    const client = this.createClient(authStrategy);
+    if (!this.registry.reserve(id, dataDir)) {
+      throw new Error(`Diretório ${dataDir} já está em uso por outra sessão`);
+    }
 
     const session: Session = {
       id,
       userId,
-      client,
+      client: null as any,
       status: "disconnected",
       qrDataUrl: null,
       addsThisHour: 0,
@@ -304,55 +382,52 @@ export class SessionManager {
       isBusy: false,
       totalAdds: 0,
       totalInvites: 0,
+      dataDir,
     };
 
     this.sessions.set(id, session);
-    this.setupClientEvents(client, session, id);
-
     session.status = "connecting";
     this.callbacks?.onStatusChange(id, "connecting");
 
-    const MAX_RETRIES = 3;
-    let attempt = 0;
-    let currentClient = client;
-    const tryInit = async () => {
-      attempt++;
-      try {
-        log(`Session ${id} initializing (attempt ${attempt}/${MAX_RETRIES})...`, "session");
-        await currentClient.initialize();
-        log(`Session ${id} initialized successfully`, "session");
-      } catch (err: any) {
-        const errMsg = err.message || String(err);
-        log(`Session ${id} init error (attempt ${attempt}/${MAX_RETRIES}): ${errMsg}`, "session");
+    const initTask = async () => {
+      const MAX_RETRIES = 3;
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
-          const bp = currentClient.pupBrowser?.process();
-          if (bp?.pid) {
-            try { execSync(`kill -9 ${bp.pid} 2>/dev/null`); } catch {}
+          log(`Session ${id} initializing (attempt ${attempt}/${MAX_RETRIES})...`, "session");
+
+          this.killProcessesForDir(dataDir);
+          this.nukeDir(dataDir);
+          this.cleanupLocksInDir(path.dirname(dataDir));
+
+          const client = this.createClient(dataDir);
+          session.client = client;
+          this.setupClientEvents(client, session, id);
+
+          await client.initialize();
+          log(`Session ${id} initialized successfully`, "session");
+          return;
+        } catch (err: any) {
+          const errMsg = err.message || String(err);
+          log(`Session ${id} init error (attempt ${attempt}/${MAX_RETRIES}): ${errMsg}`, "session");
+
+          if (session.client) {
+            await this.destroyClient(session);
           }
-          await currentClient.destroy();
-        } catch {}
-        this.killBrowserForDataDir(authPath);
-        if (attempt < MAX_RETRIES) {
-          log(`Retrying session ${id} after cleanup...`, "session");
-          this.nukeSessionDir(authPath);
-          this.cleanupChromiumLocks(authPath);
-          await new Promise(r => setTimeout(r, 5000));
-          const retryAuth = new DirectAuth(authPath);
-          currentClient = this.createClient(retryAuth);
-          session.client = currentClient;
-          this.setupClientEvents(currentClient, session, id);
-          session.status = "connecting";
-          this.callbacks?.onStatusChange(id, "connecting");
-          await tryInit();
-        } else {
-          log(`Session ${id} failed after ${MAX_RETRIES} attempts: ${errMsg}`, "session");
-          session.status = "auth_failure";
-          this.callbacks?.onStatusChange(id, "auth_failure");
+
+          if (attempt < MAX_RETRIES) {
+            log(`Retrying session ${id} in 5s...`, "session");
+            await new Promise(r => setTimeout(r, 5000));
+          } else {
+            log(`Session ${id} failed after ${MAX_RETRIES} attempts`, "session");
+            session.status = "auth_failure";
+            this.callbacks?.onStatusChange(id, "auth_failure");
+          }
         }
       }
     };
 
-    tryInit();
+    this.initQueue.push(initTask);
+    this.processInitQueue();
 
     return id;
   }
@@ -361,18 +436,8 @@ export class SessionManager {
     const session = this.sessions.get(id);
     if (!session) return;
     if (userId !== undefined && session.userId !== userId) return;
-    try {
-      const browserProcess = session.client?.pupBrowser?.process();
-      const pid = browserProcess?.pid;
-      await session.client.destroy();
-      if (pid) {
-        try {
-          execSync(`kill -9 ${pid} 2>/dev/null`);
-        } catch {}
-      }
-    } catch {}
+    await this.destroyClient(session);
     this.sessions.delete(id);
-    this.cleanupChromiumLocks();
     log(`Session ${id} removed`, "session");
   }
 
@@ -747,7 +812,6 @@ export class SessionManager {
       if (addResult && typeof addResult === "object") {
         const statusObj = addResult[participantId] || addResult;
         const code = statusObj?.code || statusObj?.status;
-        const inviteSent = statusObj?.isInviteV4Sent === true;
 
         if (code === 200 || code === "200") {
           return { added: true, rateLimited: false, privacyBlocked: false, timeout: false };
