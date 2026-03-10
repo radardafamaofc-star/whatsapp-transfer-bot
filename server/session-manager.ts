@@ -30,6 +30,12 @@ class DirectAuth {
   }
 
   async afterBrowserInitialized() {}
+
+  async onAuthenticationNeeded() {
+    return { failed: false, restart: false, failureEventPayload: undefined };
+  }
+
+  async getAuthEventPayload() {}
   async afterAuthReady() {}
   async disconnect() {}
   async destroy() {}
