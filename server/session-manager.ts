@@ -8,6 +8,9 @@ import type {
 } from "@shared/schema";
 import { log } from "./index";
 import QRCode from "qrcode";
+import { execSync } from "child_process";
+import fs from "fs";
+import path from "path";
 
 function randomDelay(minMs: number, maxMs: number): number {
   return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
@@ -73,23 +76,25 @@ export class SessionManager {
 
   private killOrphanChromiumProcesses(): void {
     try {
-      const { execSync } = require("child_process");
+      const activePids = new Set<string>();
+      for (const session of this.sessions.values()) {
+        try {
+          const bp = session.client?.pupBrowser?.process();
+          if (bp?.pid) activePids.add(String(bp.pid));
+        } catch {}
+      }
       try {
-        const pids = execSync("pgrep -f 'chromium|chrome' 2>/dev/null", { encoding: "utf-8" }).trim();
-        if (pids) {
-          const activePids = new Set<string>();
-          for (const session of this.sessions.values()) {
-            try {
-              const browserProcess = session.client?.pupBrowser?.process();
-              if (browserProcess?.pid) activePids.add(String(browserProcess.pid));
-            } catch {}
-          }
-          for (const pid of pids.split("\n")) {
-            const trimmed = pid.trim();
-            if (trimmed && !activePids.has(trimmed)) {
+        const output = execSync(
+          "ps -eo pid,args 2>/dev/null | grep -i '[c]hromium\\|[c]hrome' | grep -v playwright | awk '{print $1}'",
+          { encoding: "utf-8" }
+        ).trim();
+        if (output) {
+          for (const pid of output.split("\n")) {
+            const p = pid.trim();
+            if (p && !activePids.has(p)) {
               try {
-                execSync(`kill -9 ${trimmed} 2>/dev/null`);
-                log(`Killed orphan Chromium process: ${trimmed}`, "session");
+                execSync(`kill -9 ${p} 2>/dev/null`);
+                log(`Killed orphan Chromium PID ${p}`, "session");
               } catch {}
             }
           }
@@ -99,30 +104,11 @@ export class SessionManager {
   }
 
   private cleanupChromiumLocks(authPath?: string): void {
+    const basePath = authPath || ".wwebjs_auth";
     try {
-      const fs = require("fs");
-      const path = require("path");
-      const lockFiles = ["SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile"];
-      const basePath = authPath || ".wwebjs_auth";
-      
-      const walkDir = (dir: string) => {
-        try {
-          const entries = fs.readdirSync(dir, { withFileTypes: true });
-          for (const entry of entries) {
-            const fullPath = path.join(dir, entry.name);
-            if (entry.isDirectory()) {
-              walkDir(fullPath);
-            } else if (lockFiles.includes(entry.name)) {
-              try {
-                fs.unlinkSync(fullPath);
-                log(`Removed stale lock: ${fullPath}`, "session");
-              } catch {}
-            }
-          }
-        } catch {}
-      };
-      
-      walkDir(basePath);
+      const cmd = `find "${basePath}" \\( -name "SingletonLock" -o -name "SingletonSocket" -o -name "SingletonCookie" -o -name "lockfile" -o -name "*.lock" \\) -exec rm -f {} + 2>/dev/null; find "${basePath}" -type l -name "Singleton*" -exec rm -f {} + 2>/dev/null`;
+      execSync(cmd);
+      log(`Cleaned locks in ${basePath}`, "session");
     } catch {}
   }
 
@@ -298,7 +284,6 @@ export class SessionManager {
       await session.client.destroy();
       if (pid) {
         try {
-          const { execSync } = require("child_process");
           execSync(`kill -9 ${pid} 2>/dev/null`);
         } catch {}
       }
