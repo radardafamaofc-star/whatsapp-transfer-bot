@@ -145,8 +145,6 @@ export class SessionManager {
           "--disable-dev-shm-usage",
           "--disable-accelerated-2d-canvas",
           "--no-first-run",
-          "--no-zygote",
-          "--single-process",
           "--disable-gpu",
           "--disable-extensions",
           "--disable-software-rasterizer",
@@ -156,6 +154,7 @@ export class SessionManager {
           "--disable-sync",
           "--metrics-recording-only",
           "--no-default-browser-check",
+          "--js-flags=--max-old-space-size=256",
         ],
       },
     });
@@ -229,13 +228,17 @@ export class SessionManager {
 
     const userSessions = this.getSessionsForUser(userId);
     const isFirst = userSessions.length === 0;
+    const clientId = `user-${userId}-${id}`;
     const authPath = isFirst
       ? `.wwebjs_auth/user-${userId}`
-      : `.wwebjs_auth/session-user-${userId}-${id}`;
+      : `.wwebjs_auth/session-${clientId}`;
     const authStrategy = isFirst
       ? new LocalAuth({ dataPath: `.wwebjs_auth/user-${userId}` })
-      : new LocalAuth({ clientId: `user-${userId}-${id}` });
+      : new LocalAuth({ clientId });
 
+    log(`Adding session ${id} for user ${userId} (isFirst=${isFirst}, authPath=${authPath})`, "session");
+
+    try { fs.mkdirSync(authPath, { recursive: true }); } catch {}
     this.cleanupChromiumLocks(authPath);
 
     const client = this.createClient(authStrategy);
@@ -266,14 +269,23 @@ export class SessionManager {
     const tryInit = async () => {
       attempt++;
       try {
+        log(`Session ${id} initializing (attempt ${attempt}/${MAX_RETRIES})...`, "session");
         await currentClient.initialize();
+        log(`Session ${id} initialized successfully`, "session");
       } catch (err: any) {
-        log(`Session ${id} init error (attempt ${attempt}/${MAX_RETRIES}): ${err.message}`, "session");
-        try { await currentClient.destroy(); } catch {}
+        const errMsg = err.message || String(err);
+        log(`Session ${id} init error (attempt ${attempt}/${MAX_RETRIES}): ${errMsg}`, "session");
+        try {
+          const bp = currentClient.pupBrowser?.process();
+          if (bp?.pid) {
+            try { execSync(`kill -9 ${bp.pid} 2>/dev/null`); } catch {}
+          }
+          await currentClient.destroy();
+        } catch {}
         if (attempt < MAX_RETRIES) {
           log(`Retrying session ${id} after cleanup...`, "session");
           this.cleanupChromiumLocks(authPath);
-          await new Promise(r => setTimeout(r, 3000));
+          await new Promise(r => setTimeout(r, 5000));
           currentClient = this.createClient(authStrategy);
           session.client = currentClient;
           this.setupClientEvents(currentClient, session, id);
@@ -281,7 +293,7 @@ export class SessionManager {
           this.callbacks?.onStatusChange(id, "connecting");
           await tryInit();
         } else {
-          log(`Session ${id} failed after ${MAX_RETRIES} attempts`, "session");
+          log(`Session ${id} failed after ${MAX_RETRIES} attempts: ${errMsg}`, "session");
           session.status = "auth_failure";
           this.callbacks?.onStatusChange(id, "auth_failure");
         }
