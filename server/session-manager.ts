@@ -236,7 +236,6 @@ export class SessionManager {
       ? new LocalAuth({ dataPath: `.wwebjs_auth/user-${userId}` })
       : new LocalAuth({ clientId: `user-${userId}-${id}` });
 
-    this.killOrphanChromiumProcesses();
     this.cleanupChromiumLocks(authPath);
 
     const client = this.createClient(authStrategy);
@@ -263,20 +262,21 @@ export class SessionManager {
 
     const MAX_RETRIES = 3;
     let attempt = 0;
+    let currentClient = client;
     const tryInit = async () => {
       attempt++;
       try {
-        await client.initialize();
+        await currentClient.initialize();
       } catch (err: any) {
         log(`Session ${id} init error (attempt ${attempt}/${MAX_RETRIES}): ${err.message}`, "session");
+        try { await currentClient.destroy(); } catch {}
         if (attempt < MAX_RETRIES) {
           log(`Retrying session ${id} after cleanup...`, "session");
-          this.killOrphanChromiumProcesses();
           this.cleanupChromiumLocks(authPath);
-          await new Promise(r => setTimeout(r, 2000));
-          const newClient = this.createClient(authStrategy);
-          session.client = newClient;
-          this.setupClientEvents(newClient, session, id);
+          await new Promise(r => setTimeout(r, 3000));
+          currentClient = this.createClient(authStrategy);
+          session.client = currentClient;
+          this.setupClientEvents(currentClient, session, id);
           session.status = "connecting";
           this.callbacks?.onStatusChange(id, "connecting");
           await tryInit();
