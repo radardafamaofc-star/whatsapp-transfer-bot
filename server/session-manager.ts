@@ -12,6 +12,30 @@ import { execSync } from "child_process";
 import fs from "fs";
 import path from "path";
 
+class DirectAuth {
+  private dataDir: string;
+  private client: any;
+
+  constructor(dataDir: string) {
+    this.dataDir = path.resolve(dataDir);
+  }
+
+  setup(client: any) {
+    this.client = client;
+  }
+
+  async beforeBrowserInitialized() {
+    fs.mkdirSync(this.dataDir, { recursive: true });
+    this.client.options.puppeteer.userDataDir = this.dataDir;
+  }
+
+  async afterBrowserInitialized() {}
+  async afterAuthReady() {}
+  async disconnect() {}
+  async destroy() {}
+  async logout() {}
+}
+
 function randomDelay(minMs: number, maxMs: number): number {
   return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
 }
@@ -258,23 +282,14 @@ export class SessionManager {
 
     const userSessions = this.getSessionsForUser(userId);
     const isFirst = userSessions.length === 0;
-    const clientId = `user-${userId}-${id}`;
-    const authPath = isFirst
-      ? `.wwebjs_auth/user-${userId}`
-      : `.wwebjs_auth/session-${clientId}`;
-    const authStrategy = isFirst
-      ? new LocalAuth({ dataPath: `.wwebjs_auth/user-${userId}` })
-      : new LocalAuth({ clientId });
+    const authPath = `.wwebjs_auth/user-${userId}-${id}`;
 
     log(`Adding session ${id} for user ${userId} (isFirst=${isFirst}, authPath=${authPath})`, "session");
 
     this.killBrowserForDataDir(authPath);
-    if (!isFirst) {
-      this.nukeSessionDir(authPath);
-    }
-    try { fs.mkdirSync(authPath, { recursive: true }); } catch {}
     this.cleanupChromiumLocks(authPath);
 
+    const authStrategy = new DirectAuth(authPath);
     const client = this.createClient(authStrategy);
 
     const session: Session = {
@@ -319,11 +334,11 @@ export class SessionManager {
         this.killBrowserForDataDir(authPath);
         if (attempt < MAX_RETRIES) {
           log(`Retrying session ${id} after cleanup...`, "session");
-          if (!isFirst) { this.nukeSessionDir(authPath); }
-          try { fs.mkdirSync(authPath, { recursive: true }); } catch {}
+          this.nukeSessionDir(authPath);
           this.cleanupChromiumLocks(authPath);
           await new Promise(r => setTimeout(r, 5000));
-          currentClient = this.createClient(authStrategy);
+          const retryAuth = new DirectAuth(authPath);
+          currentClient = this.createClient(retryAuth);
           session.client = currentClient;
           this.setupClientEvents(currentClient, session, id);
           session.status = "connecting";
