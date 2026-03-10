@@ -12,6 +12,30 @@ import { execSync } from "child_process";
 import fs from "fs";
 import path from "path";
 
+class DirectAuth {
+  private dataDir: string;
+  private client: any;
+
+  constructor(dataDir: string) {
+    this.dataDir = dataDir;
+  }
+
+  setup(client: any) {
+    this.client = client;
+  }
+
+  async beforeBrowserInitialized() {
+    fs.mkdirSync(this.dataDir, { recursive: true });
+    this.client.options.puppeteer.userDataDir = this.dataDir;
+  }
+
+  async afterBrowserInitialized() {}
+  async afterAuthReady() {}
+  async disconnect() {}
+  async destroy() {}
+  async logout() {}
+}
+
 function randomDelay(minMs: number, maxMs: number): number {
   return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
 }
@@ -252,18 +276,9 @@ export class SessionManager {
   private createClient(dataDir: string): any {
     const absDir = path.resolve(dataDir);
     fs.mkdirSync(absDir, { recursive: true });
+    const auth = new DirectAuth(absDir);
     return new Client({
-      authStrategy: {
-        setup: function(client: any) { (this as any)._client = client; },
-        beforeBrowserInitialized: function() {
-          (this as any)._client.options.puppeteer.userDataDir = absDir;
-        },
-        afterBrowserInitialized: async function() {},
-        afterAuthReady: async function() {},
-        disconnect: async function() {},
-        destroy: async function() {},
-        logout: async function() {},
-      },
+      authStrategy: auth,
       puppeteer: {
         headless: true,
         executablePath: CHROMIUM_PATH,
