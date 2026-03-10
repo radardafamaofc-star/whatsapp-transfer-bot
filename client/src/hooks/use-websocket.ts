@@ -95,6 +95,23 @@ export function useWebSocket(userId?: number) {
     };
   }, [connect]);
 
+  useEffect(() => {
+    if (status === "connected" || userId === undefined) return;
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/whatsapp/status`, { credentials: "include" });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.status === "connected" && status !== "connected") {
+            setStatus("connected");
+            setQrCode(null);
+          }
+        }
+      } catch {}
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [status, userId]);
+
   const clearError = useCallback(() => setLastError(null), []);
 
   return {
