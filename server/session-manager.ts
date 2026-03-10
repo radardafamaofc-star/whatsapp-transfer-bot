@@ -42,6 +42,7 @@ export class SessionManager {
   private sessionCounter = 0;
 
   constructor() {
+    this.killOrphanChromiumProcesses();
     this.cleanupChromiumLocks();
     log("SessionManager initialized, stale Chromium locks cleaned", "session");
   }
@@ -70,11 +71,38 @@ export class SessionManager {
     return this.getSessionsForUser(userId).find((s) => s.status === "connected") || null;
   }
 
+  private killOrphanChromiumProcesses(): void {
+    try {
+      const { execSync } = require("child_process");
+      try {
+        const pids = execSync("pgrep -f 'chromium|chrome' 2>/dev/null", { encoding: "utf-8" }).trim();
+        if (pids) {
+          const activePids = new Set<string>();
+          for (const session of this.sessions.values()) {
+            try {
+              const browserProcess = session.client?.pupBrowser?.process();
+              if (browserProcess?.pid) activePids.add(String(browserProcess.pid));
+            } catch {}
+          }
+          for (const pid of pids.split("\n")) {
+            const trimmed = pid.trim();
+            if (trimmed && !activePids.has(trimmed)) {
+              try {
+                execSync(`kill -9 ${trimmed} 2>/dev/null`);
+                log(`Killed orphan Chromium process: ${trimmed}`, "session");
+              } catch {}
+            }
+          }
+        }
+      } catch {}
+    } catch {}
+  }
+
   private cleanupChromiumLocks(authPath?: string): void {
     try {
       const fs = require("fs");
       const path = require("path");
-      const lockFiles = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
+      const lockFiles = ["SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile"];
       const basePath = authPath || ".wwebjs_auth";
       
       const walkDir = (dir: string) => {
@@ -98,22 +126,8 @@ export class SessionManager {
     } catch {}
   }
 
-  async addSession(userId: number): Promise<string> {
-    this.sessionCounter++;
-    const id = `session-${this.sessionCounter}`;
-
-    const userSessions = this.getSessionsForUser(userId);
-    const isFirst = userSessions.length === 0;
-    const authPath = isFirst
-      ? `.wwebjs_auth/user-${userId}`
-      : `.wwebjs_auth/session-user-${userId}-${id}`;
-    const authStrategy = isFirst
-      ? new LocalAuth({ dataPath: `.wwebjs_auth/user-${userId}` })
-      : new LocalAuth({ clientId: `user-${userId}-${id}` });
-
-    this.cleanupChromiumLocks(authPath);
-
-    const client = new Client({
+  private createClient(authStrategy: any): any {
+    return new Client({
       authStrategy,
       puppeteer: {
         headless: true,
@@ -140,23 +154,9 @@ export class SessionManager {
         ],
       },
     });
+  }
 
-    const session: Session = {
-      id,
-      userId,
-      client,
-      status: "disconnected",
-      qrDataUrl: null,
-      addsThisHour: 0,
-      hourStart: Date.now(),
-      cooldownUntil: 0,
-      isBusy: false,
-      totalAdds: 0,
-      totalInvites: 0,
-    };
-
-    this.sessions.set(id, session);
-
+  private setupClientEvents(client: any, session: Session, id: string): void {
     let qrAttempts = 0;
     const MAX_QR_ATTEMPTS = 15;
 
@@ -216,15 +216,74 @@ export class SessionManager {
       session.qrDataUrl = null;
       this.callbacks?.onStatusChange(id, "disconnected");
     });
+  }
+
+  async addSession(userId: number): Promise<string> {
+    this.sessionCounter++;
+    const id = `session-${this.sessionCounter}`;
+
+    const userSessions = this.getSessionsForUser(userId);
+    const isFirst = userSessions.length === 0;
+    const authPath = isFirst
+      ? `.wwebjs_auth/user-${userId}`
+      : `.wwebjs_auth/session-user-${userId}-${id}`;
+    const authStrategy = isFirst
+      ? new LocalAuth({ dataPath: `.wwebjs_auth/user-${userId}` })
+      : new LocalAuth({ clientId: `user-${userId}-${id}` });
+
+    this.killOrphanChromiumProcesses();
+    this.cleanupChromiumLocks(authPath);
+
+    const client = this.createClient(authStrategy);
+
+    const session: Session = {
+      id,
+      userId,
+      client,
+      status: "disconnected",
+      qrDataUrl: null,
+      addsThisHour: 0,
+      hourStart: Date.now(),
+      cooldownUntil: 0,
+      isBusy: false,
+      totalAdds: 0,
+      totalInvites: 0,
+    };
+
+    this.sessions.set(id, session);
+    this.setupClientEvents(client, session, id);
 
     session.status = "connecting";
     this.callbacks?.onStatusChange(id, "connecting");
 
-    client.initialize().catch((err: any) => {
-      log(`Session ${id} init error: ${err.message}`, "session");
-      session.status = "auth_failure";
-      this.callbacks?.onStatusChange(id, "auth_failure");
-    });
+    const MAX_RETRIES = 3;
+    let attempt = 0;
+    const tryInit = async () => {
+      attempt++;
+      try {
+        await client.initialize();
+      } catch (err: any) {
+        log(`Session ${id} init error (attempt ${attempt}/${MAX_RETRIES}): ${err.message}`, "session");
+        if (attempt < MAX_RETRIES) {
+          log(`Retrying session ${id} after cleanup...`, "session");
+          this.killOrphanChromiumProcesses();
+          this.cleanupChromiumLocks(authPath);
+          await new Promise(r => setTimeout(r, 2000));
+          const newClient = this.createClient(authStrategy);
+          session.client = newClient;
+          this.setupClientEvents(newClient, session, id);
+          session.status = "connecting";
+          this.callbacks?.onStatusChange(id, "connecting");
+          await tryInit();
+        } else {
+          log(`Session ${id} failed after ${MAX_RETRIES} attempts`, "session");
+          session.status = "auth_failure";
+          this.callbacks?.onStatusChange(id, "auth_failure");
+        }
+      }
+    };
+
+    tryInit();
 
     return id;
   }
@@ -234,10 +293,18 @@ export class SessionManager {
     if (!session) return;
     if (userId !== undefined && session.userId !== userId) return;
     try {
+      const browserProcess = session.client?.pupBrowser?.process();
+      const pid = browserProcess?.pid;
       await session.client.destroy();
-    } catch {
-    }
+      if (pid) {
+        try {
+          const { execSync } = require("child_process");
+          execSync(`kill -9 ${pid} 2>/dev/null`);
+        } catch {}
+      }
+    } catch {}
     this.sessions.delete(id);
+    this.cleanupChromiumLocks();
     log(`Session ${id} removed`, "session");
   }
 
