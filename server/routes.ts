@@ -174,7 +174,8 @@ export async function registerRoutes(
 
   app.get("/api/whatsapp/groups", requireAuth, async (req, res) => {
     try {
-      const groups = await whatsappService.getGroups(req.user!.id);
+      const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Tempo limite excedido ao carregar grupos. Tente novamente.")), 130000));
+      const groups = await Promise.race([whatsappService.getGroups(req.user!.id), timeout]);
       res.json(groups);
     } catch (err: any) {
       res.status(500).json({ message: err.message });
