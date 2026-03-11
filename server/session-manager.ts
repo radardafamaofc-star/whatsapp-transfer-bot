@@ -65,6 +65,7 @@ interface Session {
   totalAdds: number;
   totalInvites: number;
   dataDir: string;
+  _stateMonitor?: ReturnType<typeof setInterval>;
 }
 
 interface CachedData<T> {
@@ -371,8 +372,28 @@ export class SessionManager {
       log(`Session ${id} disconnected: ${reason}`, "session");
       session.status = "disconnected";
       session.qrDataUrl = null;
+      if (session._stateMonitor) clearInterval(session._stateMonitor);
       this.callbacks?.onStatusChange(id, "disconnected");
     });
+
+    session._stateMonitor = setInterval(() => {
+      if (session.status === "connected" || session.status === "disconnected" || session.status === "auth_failure") {
+        clearInterval(session._stateMonitor);
+        return;
+      }
+      try {
+        if (client.info?.wid) {
+          log(`Session ${id} state monitor detected client.info.wid — forcing connected`, "session");
+          session.status = "connected";
+          session.qrDataUrl = null;
+          session.phoneNumber = client.info.wid.user || undefined;
+          const bp = client.pupBrowser?.process();
+          if (bp?.pid) this.registry.registerPid(id, bp.pid);
+          this.callbacks?.onStatusChange(id, "connected");
+          clearInterval(session._stateMonitor);
+        }
+      } catch {}
+    }, 5000);
   }
 
   private async processInitQueue(): Promise<void> {
