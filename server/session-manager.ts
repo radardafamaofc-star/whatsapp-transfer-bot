@@ -1,5 +1,5 @@
 import pkg from "whatsapp-web.js";
-const { Client } = pkg;
+const { Client, LocalAuth } = pkg;
 import type {
   WhatsAppStatus,
   WhatsAppGroup,
@@ -11,36 +11,6 @@ import QRCode from "qrcode";
 import { execSync } from "child_process";
 import fs from "fs";
 import path from "path";
-
-class DirectAuth {
-  private dataDir: string;
-  private client: any;
-
-  constructor(dataDir: string) {
-    this.dataDir = dataDir;
-  }
-
-  setup(client: any) {
-    this.client = client;
-  }
-
-  async beforeBrowserInitialized() {
-    fs.mkdirSync(this.dataDir, { recursive: true });
-    this.client.options.puppeteer.userDataDir = this.dataDir;
-  }
-
-  async afterBrowserInitialized() {}
-
-  async onAuthenticationNeeded() {
-    return { failed: false, restart: false, failureEventPayload: undefined };
-  }
-
-  async getAuthEventPayload() {}
-  async afterAuthReady() {}
-  async disconnect() {}
-  async destroy() {}
-  async logout() {}
-}
 
 function randomDelay(minMs: number, maxMs: number): number {
   return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
@@ -95,7 +65,6 @@ const PUPPETEER_ARGS = [
   "--disable-gpu",
   "--no-first-run",
   "--no-zygote",
-  "--single-process",
   "--disable-extensions",
   "--disable-accelerated-2d-canvas",
   "--disable-software-rasterizer",
@@ -280,18 +249,22 @@ export class SessionManager {
     this.registry.release(session.id, session.dataDir);
   }
 
-  private createClient(dataDir: string): any {
-    const absDir = path.resolve(dataDir);
-    fs.mkdirSync(absDir, { recursive: true });
-    const auth = new DirectAuth(absDir);
+  private createClient(dataDir: string, sessionId: string): any {
+    const authDir = path.resolve(path.dirname(dataDir));
+    fs.mkdirSync(authDir, { recursive: true });
+    const clientId = path.basename(dataDir);
+    log(`Creating client with LocalAuth clientId=${clientId}, dataPath=${authDir}`, "session");
     return new Client({
-      authStrategy: auth,
+      authStrategy: new LocalAuth({
+        clientId,
+        dataPath: authDir,
+      }),
       puppeteer: {
         headless: true,
         executablePath: CHROMIUM_PATH,
         protocolTimeout: 600000,
         timeout: 180000,
-        args: [...PUPPETEER_ARGS, `--user-data-dir=${absDir}`],
+        args: PUPPETEER_ARGS,
       },
     });
   }
@@ -454,10 +427,9 @@ export class SessionManager {
           log(`Session ${id} initializing (attempt ${attempt}/${MAX_RETRIES})...`, "session");
 
           this.killProcessesForDir(dataDir);
-          this.nukeDir(dataDir);
           this.cleanupLocksInDir(path.dirname(dataDir));
 
-          const client = this.createClient(dataDir);
+          const client = this.createClient(dataDir, id);
           session.client = client;
           this.setupClientEvents(client, session, id);
 
