@@ -325,14 +325,30 @@ export class SessionManager {
       this.callbacks?.onStatusChange(id, "qr_code");
     });
 
-    client.on("loading_screen", () => {
+    client.on("loading_screen", (percent: number, message: string) => {
+      log(`Session ${id} loading: ${percent}% - ${message}`, "session");
       session.status = "connecting";
       this.callbacks?.onStatusChange(id, "connecting");
     });
 
     client.on("authenticated", () => {
+      log(`Session ${id} authenticated, waiting for ready...`, "session");
       session.status = "connecting";
+      session.qrDataUrl = null;
       this.callbacks?.onStatusChange(id, "connecting");
+
+      setTimeout(() => {
+        if (session.status !== "connected" && session.status !== "disconnected" && session.status !== "auth_failure") {
+          log(`Session ${id} ready timeout — forcing connected status`, "session");
+          if (client.info?.wid) {
+            session.status = "connected";
+            session.phoneNumber = client.info.wid.user || undefined;
+            const bp = client.pupBrowser?.process();
+            if (bp?.pid) this.registry.registerPid(id, bp.pid);
+            this.callbacks?.onStatusChange(id, "connected");
+          }
+        }
+      }, 30000);
     });
 
     client.on("auth_failure", () => {

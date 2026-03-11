@@ -102,13 +102,15 @@ export function useWebSocket(userId?: number) {
         const res = await fetch(`/api/whatsapp/status`, { credentials: "include" });
         if (res.ok) {
           const data = await res.json();
-          if (data.status === "connected" && status !== "connected") {
-            setStatus("connected");
-            setQrCode(null);
+          if (data.status && data.status !== status) {
+            setStatus(data.status);
+            if (data.status === "connected" || data.status === "disconnected") {
+              setQrCode(null);
+            }
           }
         }
       } catch {}
-    }, 3000);
+    }, 2000);
     return () => clearInterval(interval);
   }, [status, userId]);
 
