@@ -598,6 +598,32 @@ export class SessionManager {
     };
   }
 
+  private async retryOnDetachedFrame<T>(session: Session, fn: () => Promise<T>, label: string): Promise<T> {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        return await fn();
+      } catch (err: any) {
+        const msg = err?.message || String(err);
+        if (msg.includes("detached") || msg.includes("Execution context") || msg.includes("Target closed")) {
+          log(`${label} attempt ${attempt}/3 failed (detached frame), refreshing page...`, "session");
+          try {
+            const page = session.client.pupPage;
+            if (page && !page.isClosed()) {
+              await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+              await new Promise((r) => setTimeout(r, 5000));
+            }
+          } catch (refreshErr: any) {
+            log(`Page refresh failed: ${refreshErr.message}`, "session");
+          }
+          if (attempt === 3) throw err;
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new Error(`${label} failed after 3 attempts`);
+  }
+
   async getGroups(userId?: number): Promise<WhatsAppGroup[]> {
     const uid = userId ?? -1;
     const cached = this.groupsCache.get(uid);
@@ -609,27 +635,29 @@ export class SessionManager {
     const session = userId !== undefined ? this.getFirstConnectedSessionForUser(userId) : this.getFirstConnectedSession();
     if (!session) throw new Error("Nenhuma sessão conectada");
 
-    const chats = await withTimeout(session.client.getChats(), 120000, "Carregar grupos");
-    const groups = chats.filter((c: any) => c.isGroup);
-    const me = session.client.info?.wid?._serialized;
+    const result = await this.retryOnDetachedFrame(session, async () => {
+      const chats = await withTimeout(session.client.getChats(), 120000, "Carregar grupos");
+      const groups = chats.filter((c: any) => c.isGroup);
+      const me = session.client.info?.wid?._serialized;
 
-    const result = groups.map((g: any) => {
-      let participantCount = 0;
-      const cachedParticipants = g.participants || [];
-      if (cachedParticipants.length > 0) {
-        participantCount = cachedParticipants.length;
-      } else {
-        participantCount = g.groupMetadata?.participants?.length || g.groupMetadata?.size || 0;
-      }
+      return groups.map((g: any) => {
+        let participantCount = 0;
+        const cachedParticipants = g.participants || [];
+        if (cachedParticipants.length > 0) {
+          participantCount = cachedParticipants.length;
+        } else {
+          participantCount = g.groupMetadata?.participants?.length || g.groupMetadata?.size || 0;
+        }
 
-      const myP = cachedParticipants.find((p: any) => p.id?._serialized === me);
-      return {
-        id: g.id._serialized,
-        name: g.name,
-        participantCount,
-        isAdmin: myP?.isAdmin || myP?.isSuperAdmin || false,
-      };
-    });
+        const myP = cachedParticipants.find((p: any) => p.id?._serialized === me);
+        return {
+          id: g.id._serialized,
+          name: g.name,
+          participantCount,
+          isAdmin: myP?.isAdmin || myP?.isSuperAdmin || false,
+        };
+      });
+    }, "getGroups");
 
     this.groupsCache.set(uid, { data: result, timestamp: Date.now() });
     return result;
@@ -656,56 +684,60 @@ export class SessionManager {
     const session = userId !== undefined ? this.getFirstConnectedSessionForUser(userId) : this.getFirstConnectedSession();
     if (!session) throw new Error("Nenhuma sessão conectada");
 
-    const chats = await withTimeout(session.client.getChats(), 120000, "Carregar contatos");
-    const privateChats = chats.filter((c: any) => {
-      const id = c.id?._serialized || "";
-      return !c.isGroup && (id.endsWith("@c.us") || id.endsWith("@lid"));
-    });
-
-    const seenIds = new Set<string>();
-    const contacts: { id: string; name: string; number: string; isLid?: boolean }[] = [];
-
-    for (const chat of privateChats) {
-      const chatId = (chat as any).id._serialized;
-      if (seenIds.has(chatId)) continue;
-      seenIds.add(chatId);
-
-      const isLid = chatId.endsWith("@lid");
-      const rawNumber = chatId.replace("@c.us", "").replace("@lid", "");
-      const contactName = (chat as any).name || (chat as any).contact?.pushname || (chat as any).contact?.name || rawNumber;
-
-      contacts.push({
-        id: chatId,
-        name: contactName,
-        number: rawNumber,
-        isLid,
+    const contacts = await this.retryOnDetachedFrame(session, async () => {
+      const chats = await withTimeout(session.client.getChats(), 120000, "Carregar contatos");
+      const privateChats = chats.filter((c: any) => {
+        const id = c.id?._serialized || "";
+        return !c.isGroup && (id.endsWith("@c.us") || id.endsWith("@lid"));
       });
-    }
 
-    try {
-      const allContacts = await withTimeout(session.client.getContacts(), 60000, "Carregar lista de contatos");
-      for (const contact of allContacts) {
-        const cId = (contact as any).id?._serialized || "";
-        if (seenIds.has(cId)) continue;
-        if ((contact as any).isGroup) continue;
-        if (!cId.endsWith("@c.us") && !cId.endsWith("@lid")) continue;
-        if ((contact as any).isMe) continue;
+      const seenIds = new Set<string>();
+      const result: { id: string; name: string; number: string; isLid?: boolean }[] = [];
 
-        seenIds.add(cId);
-        const isLid = cId.endsWith("@lid");
-        const rawNumber = cId.replace("@c.us", "").replace("@lid", "");
-        const name = (contact as any).pushname || (contact as any).name || (contact as any).shortName || rawNumber;
+      for (const chat of privateChats) {
+        const chatId = (chat as any).id._serialized;
+        if (seenIds.has(chatId)) continue;
+        seenIds.add(chatId);
 
-        contacts.push({
-          id: cId,
-          name,
+        const isLid = chatId.endsWith("@lid");
+        const rawNumber = chatId.replace("@c.us", "").replace("@lid", "");
+        const contactName = (chat as any).name || (chat as any).contact?.pushname || (chat as any).contact?.name || rawNumber;
+
+        result.push({
+          id: chatId,
+          name: contactName,
           number: rawNumber,
           isLid,
         });
       }
-    } catch (err) {
-      log(`Error fetching additional contacts: ${(err as Error).message}`, "session");
-    }
+
+      try {
+        const allContacts = await withTimeout(session.client.getContacts(), 60000, "Carregar lista de contatos");
+        for (const contact of allContacts) {
+          const cId = (contact as any).id?._serialized || "";
+          if (seenIds.has(cId)) continue;
+          if ((contact as any).isGroup) continue;
+          if (!cId.endsWith("@c.us") && !cId.endsWith("@lid")) continue;
+          if ((contact as any).isMe) continue;
+
+          seenIds.add(cId);
+          const isLid = cId.endsWith("@lid");
+          const rawNumber = cId.replace("@c.us", "").replace("@lid", "");
+          const name = (contact as any).pushname || (contact as any).name || (contact as any).shortName || rawNumber;
+
+          result.push({
+            id: cId,
+            name,
+            number: rawNumber,
+            isLid,
+          });
+        }
+      } catch (err) {
+        log(`Error fetching additional contacts: ${(err as Error).message}`, "session");
+      }
+
+      return result;
+    }, "getContacts");
 
     this.contactsCache.set(uid, { data: contacts, timestamp: Date.now() });
     return contacts;
@@ -715,57 +747,59 @@ export class SessionManager {
     const session = userId !== undefined ? this.getFirstConnectedSessionForUser(userId) : this.getFirstConnectedSession();
     if (!session) throw new Error("Nenhuma sessão conectada");
 
-    const chat = await withTimeout(session.client.getChatById(groupId), 60000, "Carregar grupo");
-    if (!(chat as any).isGroup) throw new Error("Chat não é um grupo");
+    return this.retryOnDetachedFrame(session, async () => {
+      const chat = await withTimeout(session.client.getChatById(groupId), 60000, "Carregar grupo");
+      if (!(chat as any).isGroup) throw new Error("Chat não é um grupo");
 
-    let participants = (chat as any).participants || [];
-    if (participants.length === 0 && (chat as any).groupMetadata?.participants) {
-      participants = (chat as any).groupMetadata.participants;
-    }
-    if (participants.length === 0) {
-      try {
-        const metadata = await (chat as any).getGroupMetadata?.();
-        if (metadata?.participants) participants = metadata.participants;
-      } catch {}
-    }
-
-    if (participants.length === 0) {
-      log(`No participants found for ${groupId}, trying chat refresh`, "session");
-      try {
-        const freshChat = await session.client.getChatById(groupId);
-        participants = (freshChat as any).participants || [];
-      } catch {}
-    }
-
-    if (participants.length === 0) {
-      throw new Error("Não foi possível obter os membros do grupo. Verifique se a conta principal está no grupo.");
-    }
-
-    const rawList = participants.map((p: any) => ({
-      id: p.id._serialized,
-      number: p.id.user,
-      isAdmin: p.isAdmin || false,
-      isSuperAdmin: p.isSuperAdmin || false,
-      isLid: p.id._serialized.endsWith("@lid"),
-    }));
-
-    const lidParticipants = rawList.filter((p: any) => p.isLid);
-    if (lidParticipants.length > 0) {
-      log(`Resolving ${lidParticipants.length} LID participants...`, "session");
-      const resolved = await this.resolveLidBatch(lidParticipants.map((p: any) => p.id));
-      for (const p of rawList) {
-        if (p.isLid && resolved.has(p.id)) {
-          const phoneId = resolved.get(p.id)!;
-          p.resolvedPhone = phoneId;
-          p.number = phoneId.replace("@c.us", "");
-          p.isLid = false;
-        }
+      let participants = (chat as any).participants || [];
+      if (participants.length === 0 && (chat as any).groupMetadata?.participants) {
+        participants = (chat as any).groupMetadata.participants;
       }
-      const unresolvedCount = rawList.filter((p: any) => p.isLid).length;
-      log(`LID resolution: ${lidParticipants.length - unresolvedCount} resolved, ${unresolvedCount} unresolved`, "session");
-    }
+      if (participants.length === 0) {
+        try {
+          const metadata = await (chat as any).getGroupMetadata?.();
+          if (metadata?.participants) participants = metadata.participants;
+        } catch {}
+      }
 
-    return rawList;
+      if (participants.length === 0) {
+        log(`No participants found for ${groupId}, trying chat refresh`, "session");
+        try {
+          const freshChat = await session.client.getChatById(groupId);
+          participants = (freshChat as any).participants || [];
+        } catch {}
+      }
+
+      if (participants.length === 0) {
+        throw new Error("Não foi possível obter os membros do grupo. Verifique se a conta principal está no grupo.");
+      }
+
+      const rawList = participants.map((p: any) => ({
+        id: p.id._serialized,
+        number: p.id.user,
+        isAdmin: p.isAdmin || false,
+        isSuperAdmin: p.isSuperAdmin || false,
+        isLid: p.id._serialized.endsWith("@lid"),
+      }));
+
+      const lidParticipants = rawList.filter((p: any) => p.isLid);
+      if (lidParticipants.length > 0) {
+        log(`Resolving ${lidParticipants.length} LID participants...`, "session");
+        const resolved = await this.resolveLidBatch(lidParticipants.map((p: any) => p.id));
+        for (const p of rawList) {
+          if (p.isLid && resolved.has(p.id)) {
+            const phoneId = resolved.get(p.id)!;
+            p.resolvedPhone = phoneId;
+            p.number = phoneId.replace("@c.us", "");
+            p.isLid = false;
+          }
+        }
+        const unresolvedCount = rawList.filter((p: any) => p.isLid).length;
+        log(`LID resolution: ${lidParticipants.length - unresolvedCount} resolved, ${unresolvedCount} unresolved`, "session");
+      }
+
+      return rawList;
+    }, "getGroupParticipants");
   }
 
   async resolveLidToPhone(lidId: string): Promise<string | null> {
